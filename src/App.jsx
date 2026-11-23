@@ -7,14 +7,42 @@ const toISO = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad
 const today = new Date();
 today.setHours(0, 0, 0, 0);
 
+// Параметры рабочего времени приходят из Telegram-бота в URL:
+// ?work_start=12:00&work_end=21:00&timezone=Europe/Moscow
+// Поддерживаются также значения часов без минут: work_start=12&work_end=21.
+function parseClock(value, fallback) {
+  if (!value) return fallback;
+  const match = String(value).trim().match(/^(\d{1,2})(?::(\d{2}))?$/);
+  if (!match) return fallback;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2] || 0);
+  if (hours > 23 || minutes > 59) return fallback;
+  return hours * 60 + minutes;
+}
+
+const urlParams = new URLSearchParams(window.location.search);
+const workStart = parseClock(urlParams.get('work_start'), 9 * 60);
+const workEnd = parseClock(urlParams.get('work_end'), 17 * 60);
+const timezone = urlParams.get('timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+function makeSlots(start, end) {
+  if (end <= start) return [];
+  const result = [];
+  // Длительность демонстрационного слота — 1 час. Последний слот
+  // начинается не позднее времени окончания рабочего интервала.
+  for (let minutes = start; minutes + 60 <= end; minutes += 60) {
+    result.push(`${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`);
+  }
+  return result;
+}
+
 // Временные демонстрационные занятые слоты. Позже заменим данными API.
 const closedSlots = {
-  [toISO(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1))]: ['10:00', '11:00', '15:00'],
+  [toISO(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1))]: ['13:00', '14:00', '15:00'],
   [toISO(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 3))]: ['12:00', '13:00', '16:00'],
-  [toISO(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 5))]: ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00'],
+  [toISO(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 5))]: ['12:00', '13:00', '14:00', '15:00', '16:00'],
 };
 
-const slots = ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00'];
 const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 const weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
@@ -23,13 +51,13 @@ export default function App() {
   const [month, setMonth] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
   const [selectedDate, setSelectedDate] = useState(toISO(today));
   const [selectedTime, setSelectedTime] = useState('');
-  const [sent, setSent] = useState(false);
 
   useEffect(() => {
     tg?.ready();
     tg?.expand();
   }, [tg]);
 
+  const slots = useMemo(() => makeSlots(workStart, workEnd), []);
   const days = useMemo(() => {
     const first = new Date(month.getFullYear(), month.getMonth(), 1);
     const count = new Date(month.getFullYear(), month.getMonth() + 1, 0).getDate();
@@ -53,50 +81,32 @@ export default function App() {
     if (!date || date < today) return;
     setSelectedDate(toISO(date));
     setSelectedTime('');
-    setSent(false);
   };
 
-  async function confirmBooking() {
-    if (!selectedDate || !selectedTime || sent) return;
+  function chooseTime() {
+    if (!selectedDate || !selectedTime) return;
 
-    const payload = { date: selectedDate, time: selectedTime };
+    const payload = {
+      type: 'time_selected',
+      date: selectedDate,
+      time: selectedTime,
+      timezone,
+    };
 
-    // Для inline Web App-кнопки можно задать VITE_BOOKING_API_URL.
-    // Сервер должен проверить initData и занятость слота перед созданием записи.
-    const apiUrl = import.meta.env.VITE_BOOKING_API_URL;
-    if (apiUrl) {
-      try {
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Telegram-Init-Data': tg?.initData || '',
-          },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) throw new Error('Не удалось подтвердить запись');
-        setSent(true);
-        tg?.HapticFeedback?.notificationOccurred('success');
-        tg?.showAlert?.('Заявка на запись отправлена');
-      } catch (error) {
-        tg?.showAlert?.(error.message || 'Ошибка отправки. Попробуйте ещё раз.');
-        if (!tg) alert(error.message || 'Ошибка отправки');
-      }
+    // sendData работает при запуске через reply KeyboardButton с web_app.
+    // Для inline Web App понадобится backend API с проверкой Telegram initData.
+    if (tg?.sendData) {
+      tg.sendData(JSON.stringify(payload));
       return;
     }
 
-    // Режим без backend: работает, когда Mini App открыт через KeyboardButton.
-    if (tg?.sendData) {
-      tg.sendData(JSON.stringify(payload));
-      setSent(true);
-      tg.HapticFeedback?.notificationOccurred('success');
-    } else {
-      alert(`Демо: выбрано ${payload.date} в ${payload.time}`);
-      setSent(true);
-    }
+    const message = `Выбрано: ${payload.date} в ${payload.time} (${payload.timezone}). Следующий шаг — в боте.`;
+    if (tg?.showAlert) tg.showAlert(message);
+    else alert(message);
   }
 
   const isTelegram = Boolean(tg?.initData);
+  const invalidWorkingHours = slots.length === 0;
 
   return (
     <main className="page">
@@ -129,7 +139,7 @@ export default function App() {
             if (!date) return <span className="empty-day" key={`empty-${index}`} />;
             const iso = toISO(date);
             const past = date < today;
-            const fullyBooked = slots.every((slot) => (closedSlots[iso] || []).includes(slot));
+            const fullyBooked = slots.length === 0 || slots.every((slot) => (closedSlots[iso] || []).includes(slot));
             return (
               <button key={iso}
                 className={`day ${iso === selectedDate ? 'selected' : ''} ${past || fullyBooked ? 'disabled' : ''}`}
@@ -157,21 +167,18 @@ export default function App() {
           </div>
           <span className="count">{available.length} слотов</span>
         </div>
-        {available.length ? (
+        {invalidWorkingHours ? (
+          <div className="empty-state">Рабочее время не настроено. Вернитесь в бот и откройте приложение по корректной ссылке.</div>
+        ) : available.length ? (
           <div className="time-grid">
-            {slots.map((slot) => {
-              const busy = unavailable.includes(slot);
-              return (
-                <button key={slot}
-                  className={`time-slot ${selectedTime === slot ? 'active' : ''} ${busy ? 'busy' : ''}`}
-                  disabled={busy}
-                  onClick={() => { setSelectedTime(slot); setSent(false); }}>
-                  {slot}
-                  {selectedTime === slot && <Check size={15} />}
-                  {busy && <span className="busy-mark">занято</span>}
-                </button>
-              );
-            })}
+            {available.map((slot) => (
+              <button key={slot}
+                className={`time-slot ${selectedTime === slot ? 'active' : ''}`}
+                onClick={() => setSelectedTime(slot)}>
+                {slot}
+                {selectedTime === slot && <Check size={15} />}
+              </button>
+            ))}
           </div>
         ) : (
           <div className="empty-state">На эту дату свободного времени нет. Выберите другой день.</div>
@@ -182,16 +189,16 @@ export default function App() {
         <div className="selection-summary">
           <div className="summary-icon"><Clock3 size={19} /></div>
           <div>
-            <span>ВАША ЗАПИСЬ</span>
+            <span>ВЫБРАННОЕ ВРЕМЯ</span>
             <strong>{selectedTime
               ? `${chosenDate.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })}, ${selectedTime}`
               : 'Выберите время'}</strong>
           </div>
         </div>
-        <button className="confirm-button" disabled={!selectedTime || sent} onClick={confirmBooking}>
-          {sent ? <><Check size={18} /> Отправлено</> : 'Подтвердить запись'}
+        <button className="confirm-button" disabled={!selectedTime} onClick={chooseTime}>
+          Выбрать время
         </button>
-        {!isTelegram && <p className="browser-note">Демо-режим: откройте приложение через Telegram для отправки данных боту.</p>}
+        {!isTelegram && <p className="browser-note">Демо-режим: в Telegram выбор времени будет передан боту для следующего шага.</p>}
       </footer>
     </main>
   );
